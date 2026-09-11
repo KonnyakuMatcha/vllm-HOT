@@ -288,6 +288,7 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        continuation_handle: str | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -344,6 +345,7 @@ class RequestState:
             finished,
             kv_transfer_params,
             ec_transfer_params,
+            continuation_handle,
         )
 
     def _new_request_output(
@@ -353,6 +355,7 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        continuation_handle: str | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -387,6 +390,7 @@ class RequestState:
             finished=finished,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
+            continuation_handle=continuation_handle,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
@@ -667,6 +671,7 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
+            continuation_handle = engine_core_output.continuation_handle
             if engine_core_output.routed_experts is not None:
                 req_state.routed_experts_chunks.append(
                     engine_core_output.routed_experts
@@ -712,6 +717,7 @@ class OutputProcessor:
                 stop_reason,
                 kv_transfer_params,
                 ec_transfer_params,
+                continuation_handle,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

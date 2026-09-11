@@ -77,6 +77,110 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## Qwen HOT Multi-Turn Benchmark
+
+This fork includes a specialized HOT continuation path for local Qwen small
+models, and a benchmark that compares it with vLLM prefix caching. The complete
+benchmark is in [`benchmarks/multi_turn/benchmark_hot_vs_prefix.py`](benchmarks/multi_turn/benchmark_hot_vs_prefix.py).
+
+The measured model was `/ssd/nfs/models/Qwen/Qwen3.6-35B-A3B-NVFP4`. Both runs
+used two GPUs, `--tensor-parallel-size 2`, `--max-num-seqs 1`,
+`--max-model-len 96000`, and CUDA graphs (`--enforce-eager` was not used):
+
+```bash
+MODEL=/ssd/nfs/models/Qwen/Qwen3.6-35B-A3B-NVFP4
+
+# HOT: continuation enabled, prefix caching disabled
+CUDA_VISIBLE_DEVICES=0,1 VLLM_ENABLE_HOT_CONTINUATION=1 \
+  .venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --served-model-name qwen-nvfp4 \
+  --tensor-parallel-size 2 --max-num-seqs 1 --max-model-len 96000 \
+  --port 8000
+
+.venv/bin/python benchmarks/multi_turn/benchmark_hot_vs_prefix.py \
+  --mode hot --context-chars 96000 --output /tmp/qwen-hot.json
+
+# Prefix: HOT disabled, automatic prefix caching enabled
+CUDA_VISIBLE_DEVICES=0,1 VLLM_ENABLE_HOT_CONTINUATION=0 \
+  .venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --served-model-name qwen-nvfp4 \
+  --tensor-parallel-size 2 --max-num-seqs 1 --max-model-len 96000 \
+  --enable-prefix-caching --port 8000
+
+.venv/bin/python benchmarks/multi_turn/benchmark_hot_vs_prefix.py \
+  --mode prefix --context-chars 96000 --output /tmp/qwen-prefix.json
+```
+
+Use `--mode cold` with both optimizations disabled for the no-cache baseline.
+Run every mode in a fresh server process with identical model, GPU, context,
+turn count, and generation settings.
+
+### Test Method and TTFT Definition
+
+The workload is one four-turn conversation. The first turn establishes the
+context; subsequent turns append a short user tail. The persistent context is
+96,000 characters, about 18,526 prompt tokens on turn 1, and each turn
+generates four tokens. Requests use the streaming Chat API with fixed
+`seed=0`, `temperature=0`, and `return_token_ids=true`.
+
+The benchmark starts its timer immediately before sending the HTTP request.
+TTFT is recorded when the first non-empty `delta.content` or
+`delta.reasoning_content` arrives. Empty chunks and role-only chunks are
+ignored. Latency ends when the SSE stream receives `[DONE]`. The steady-state
+comparison uses turns 2-4 because turn 1 includes initial request and runtime
+warmup effects.
+
+### Recorded Results
+
+Results below are milliseconds; `mean` and `p50` cover turns 2-4:
+
+| Mode | TTFT mean | TTFT p50 | Latency mean | Latency p50 |
+| --- | ---: | ---: | ---: | ---: |
+| Cold | 1,226.5 | 1,227.2 | 1,232.5 | 1,233.1 |
+| Prefix cache | 168.1 | 166.8 | 169.3 | 168.2 |
+| HOT | 125.8 | 124.3 | 140.1 | 138.5 |
+
+First-turn TTFT was 1,917.0 ms for cold, 2,638.2 ms for prefix cache, and
+1,905.5 ms for HOT. These values are informational only and are not used to
+measure cache reuse. The prefix-cache server reported a 72.5% hit rate.
+
+For this single-session workload, HOT reduced steady-state TTFT by about 25%
+relative to prefix caching and about 90% relative to cold execution. HOT does
+not change model weights or the sampling policy.
+
+### HOT Compared with Prefix Cache
+
+HOT is a sequential continuation fast path. At the end of a turn it saves one
+resident checkpoint containing the exact executed-token boundary, full-
+attention KV ownership, and the latest GDN/Mamba recurrent state. The server
+returns a continuation handle. On the next turn, the client sends only the new
+tail; the scheduler validates the handle and exact boundary, transfers state
+ownership, and starts from the saved computed-token count. A mismatch releases
+the checkpoint and falls back to the normal vLLM path.
+
+Prefix caching is a shared hash/token-block lookup. The client sends the full
+conversation, matching prefix blocks are reused, and the unmatched suffix is
+prefilled. It supports shared prefixes, branching requests, and multi-tenant
+workloads without requiring requests to arrive in conversation order. For
+hybrid models, its recurrent state follows the generic cache granularity.
+
+| Property | Prefix cache | HOT |
+| --- | --- | --- |
+| Admission | Hash and look up reusable prefix blocks | Claim one exact continuation handle |
+| Client request | Full conversation history | New tail after the first turn |
+| State reuse | Shared cached blocks | Direct ownership transfer of live state |
+| GDN/Mamba state | Generic aligned cache policy | Latest recurrent state at the boundary |
+| Workload | Shared, branching, multi-tenant | One sequential active session |
+| Failure behavior | Cache miss and normal prefill | Invalidate checkpoint and fall back |
+
+HOT is not a replacement for prefix caching. It is specialized for a single
+active sequential session; prefix caching remains the general-purpose sharing
+mechanism and fallback path. Exact output-token equality is not used as an
+intelligence criterion because repeated Qwen NVFP4 runs showed CUDA/streaming
+sampling nondeterminism even with fixed seed and temperature. A semantic probe
+did preserve the remembered project value `ORBIT` and number `7319` through
+HOT continuation.
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.

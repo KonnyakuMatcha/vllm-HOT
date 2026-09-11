@@ -756,6 +756,62 @@ async def test_chat_per_request_metrics_follow_server_flag():
 
 
 @pytest.mark.asyncio
+async def test_chat_continuation_handle_in_full_response():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    request_output = _make_metrics_request_output()
+    request_output.continuation_handle = "hot-test-handle"
+
+    response = await serving.chat_completion_full_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Continue"}],
+            max_tokens=10,
+        ),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Continue"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    )
+
+    assert response.continuation_handle == "hot-test-handle"
+
+
+@pytest.mark.asyncio
+async def test_chat_continuation_handle_in_stream_response():
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    request_output = _make_metrics_request_output()
+    request_output.continuation_handle = "hot-test-handle"
+
+    chunks = []
+    async for line in serving.chat_completion_stream_generator(
+        ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Continue"}],
+            max_tokens=10,
+            stream=True,
+        ),
+        _single_request_output(request_output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=[{"role": "user", "content": "Continue"}],
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+    ):
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: ") :]
+        if payload != "[DONE]":
+            chunks.append(json.loads(payload))
+
+    assert any(
+        chunk.get("continuation_handle") == "hot-test-handle" for chunk in chunks
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_per_request_metrics_suppressed_for_n_greater_than_one():
     serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=True)
     response = await serving.chat_completion_full_generator(

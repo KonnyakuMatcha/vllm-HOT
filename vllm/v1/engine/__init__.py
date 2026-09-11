@@ -233,6 +233,10 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # Handle for an exact HOT successor state; appended last to keep
+    # `array_like` positional serialization backward compatible.
+    continuation_handle: str | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

@@ -147,6 +147,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
         default=None, description="ECTransfer parameters."
     )
     metrics: PerRequestMetrics | None = None
+    continuation_handle: str | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -179,6 +180,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
     metrics: PerRequestMetrics | None = None
+    continuation_handle: str | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -403,6 +405,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "request_id, this value is expected to remain stable across "
             "multiple requests in the same conversation or agent session."
         ),
+    )
+    continuation_handle: str | None = Field(
+        default=None,
+        description="Exact successor handle returned by a HOT-enabled completion.",
     )
 
     return_tokens_as_token_ids: bool | None = Field(
@@ -719,6 +725,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        if self.continuation_handle:
+            extra_args["continuation_handle"] = self.continuation_handle
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

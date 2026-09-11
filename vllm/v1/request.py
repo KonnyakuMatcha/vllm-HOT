@@ -193,6 +193,12 @@ class Request:
         # trace_headers
         self.trace_headers = trace_headers
         self.session_id = session_id
+        self.continuation_handle: str | None = None
+        if sampling_params is not None and sampling_params.extra_args:
+            self.continuation_handle = sampling_params.extra_args.get(
+                "continuation_handle"
+            )
+        self.hot_claimed = False
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
@@ -273,6 +279,16 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
 
+        self.update_block_hashes()
+
+    def prepend_prompt_token_ids(self, prefix_token_ids: list[int]) -> None:
+        """Prepend a HOT checkpoint when the successor submits only its tail."""
+        assert self.prompt_token_ids is not None
+        self.prompt_token_ids = prefix_token_ids + self.prompt_token_ids
+        self._all_token_ids[:] = self.prompt_token_ids
+        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.block_hashes = []
+        self._prompt_embeds_per_block_hashes.clear()
         self.update_block_hashes()
 
     def update_block_hashes(self) -> None:

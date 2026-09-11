@@ -1944,6 +1944,18 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
         return super().pop_blocks_for_free(request_id)
 
+    def get_state_block_idx(self, request_id: str) -> int | None:
+        if self.mamba_cache_mode != "align":
+            return None
+        return self.last_state_block_idx.get(request_id)
+
+    def attach_request(self, request_id: str, state_block_idx: int | None) -> None:
+        """Restore Mamba bookkeeping after an ownership transfer."""
+        if self.mamba_cache_mode == "align":
+            self._allocated_block_reqs.add(request_id)
+            if state_block_idx is not None:
+                self.last_state_block_idx[request_id] = state_block_idx
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens whose mamba state are not needed anymore. Mamba only

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -31,9 +32,14 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils import random_uuid
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
+)
+from vllm.v1.core.hot_continuation import (
+    HotContinuationCheckpoint,
+    reconstruct_continuation_tokens,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -95,6 +101,10 @@ class Scheduler(SchedulerInterface):
         self.lora_config = vllm_config.lora_config
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.kv_cache_config = kv_cache_config
+        self.hot_checkpoint: HotContinuationCheckpoint | None = None
+        self.hot_config_fingerprint = (
+            vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
+        )
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
@@ -909,9 +919,22 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
+                hot_claimed = request.num_computed_tokens == 0 and self._claim_hot(
+                    request
+                )
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if hot_claimed:
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
+                    if request.prefill_stats and request.num_preemptions <= 0:
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=num_computed_tokens,
+                            num_external_cached_tokens=0,
+                        )
+                elif request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
                     (
                         new_computed_blocks,
@@ -1491,6 +1514,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.hot_claimed = False
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2017,6 +2041,7 @@ class Scheduler(SchedulerInterface):
             kv_transfer_params = None
             ec_transfer_params = None
             prefill_stats = None
+            continuation_handle = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
@@ -2126,6 +2151,7 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    continuation_handle = self._save_hot(request)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2174,6 +2200,7 @@ class Scheduler(SchedulerInterface):
                         ),
                         kv_transfer_params=kv_transfer_params,
                         ec_transfer_params=ec_transfer_params,
+                        continuation_handle=continuation_handle,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
@@ -2348,6 +2375,96 @@ class Scheduler(SchedulerInterface):
 
         self._enqueue_waiting_request(request)
         return False
+
+    def _hot_mamba_state_transfer_supported(self) -> bool:
+        """HOT transfers the explicit latest Mamba state slot, "align" only."""
+        return self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+
+    def _hot_fingerprint(self, request: Request) -> str:
+        lora = request.lora_request
+        lora_id = None if lora is None else (lora.lora_int_id, lora.lora_name)
+        return f"{self.hot_config_fingerprint}:{lora_id}:{request.cache_salt}"
+
+    def _release_hot(self) -> None:
+        if self.hot_checkpoint is not None:
+            self.kv_cache_manager.free_blocks(self.hot_checkpoint.blocks)
+            self.hot_checkpoint = None
+
+    def _claim_hot(self, request: Request) -> bool:
+        checkpoint = self.hot_checkpoint
+        if (
+            not envs.VLLM_ENABLE_HOT_CONTINUATION
+            or self.max_num_running_reqs != 1
+            or not self._hot_mamba_state_transfer_supported()
+            or checkpoint is None
+            or request.continuation_handle is None
+            or request.prompt_token_ids is None
+            or request.prompt_embeds is not None
+            or self.connector is not None
+        ):
+            return False
+
+        if (
+            request.continuation_handle != checkpoint.handle
+            or self._hot_fingerprint(request) != checkpoint.fingerprint
+        ):
+            self._release_hot()
+            return False
+
+        tokens = tuple(request._all_token_ids)
+        boundary_tokens = checkpoint.forwarded_tokens + (checkpoint.last_token,)
+        reconstructed = reconstruct_continuation_tokens(
+            checkpoint.forwarded_tokens, checkpoint.last_token, tokens
+        )
+        if reconstructed is None:
+            self._release_hot()
+            return False
+        _, tail_only = reconstructed
+        if tail_only:
+            request.prepend_prompt_token_ids(list(boundary_tokens))
+
+        self.kv_cache_manager.attach(
+            request, checkpoint.blocks, checkpoint.mamba_state_block_indices
+        )
+        request.num_computed_tokens = checkpoint.boundary
+        request.hot_claimed = True
+        self.hot_checkpoint = None
+        return True
+
+    def _save_hot(self, request: Request) -> str | None:
+        if (
+            not envs.VLLM_ENABLE_HOT_CONTINUATION
+            or self.max_num_running_reqs != 1
+            or not self._hot_mamba_state_transfer_supported()
+            or self.num_spec_tokens > 0
+            or self.connector is not None
+            or request.prompt_token_ids is None
+            or request.prompt_embeds is not None
+            or request.mm_features
+            or not request.output_token_ids
+            or request.num_in_flight_tokens
+            or request.num_tokens - 1 != request.num_computed_tokens
+        ):
+            return None
+
+        boundary = request.num_tokens - 1
+        blocks, mamba_state_block_indices = self.kv_cache_manager.detach(request)
+        checkpoint = HotContinuationCheckpoint(
+            handle=random_uuid(),
+            forwarded_tokens=tuple(request._all_token_ids[:-1]),
+            last_token=request._all_token_ids[-1],
+            fingerprint=self._hot_fingerprint(request),
+            boundary=boundary,
+            tail_valid_tokens=tuple(
+                boundary % manager.block_size or manager.block_size
+                for manager in self.kv_cache_manager.coordinator.single_type_managers
+            ),
+            blocks=blocks,
+            mamba_state_block_indices=mamba_state_block_indices,
+        )
+        self._release_hot()
+        self.hot_checkpoint = checkpoint
+        return checkpoint.handle
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -2553,6 +2670,12 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            if (
+                not request.hot_claimed
+                and self.hot_checkpoint is not None
+                and request.continuation_handle == self.hot_checkpoint.handle
+            ):
+                self._release_hot()
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2721,6 +2844,7 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        self._release_hot()
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
@@ -2824,6 +2948,7 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        self._release_hot()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

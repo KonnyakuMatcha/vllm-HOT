@@ -384,6 +384,42 @@ class KVCacheCoordinator(ABC):
             blocks.extend(manager.pop_blocks_for_free(request_id))
         return blocks
 
+    def detach(
+        self, request_id: str
+    ) -> tuple[tuple[list[KVCacheBlock], ...], tuple[int | None, ...]]:
+        """Remove a request's block-table ownership without releasing blocks."""
+        state_block_indices = tuple(
+            manager.get_state_block_idx(request_id)
+            if isinstance(manager, MambaManager)
+            else None
+            for manager in self.single_type_managers
+        )
+        blocks = tuple(
+            manager.pop_blocks_for_free(request_id)
+            for manager in self.single_type_managers
+        )
+        return blocks, state_block_indices
+
+    def attach(
+        self,
+        request_id: str,
+        blocks: tuple[Sequence[KVCacheBlock], ...],
+        state_block_indices: tuple[int | None, ...],
+    ) -> None:
+        """Transfer already-owned blocks to a new request."""
+        assert len(blocks) == len(self.single_type_managers)
+        assert len(state_block_indices) == len(self.single_type_managers)
+        for manager, request_blocks, state_block_idx in zip(
+            self.single_type_managers,
+            blocks,
+            state_block_indices,
+            strict=True,
+        ):
+            assert request_id not in manager.req_to_blocks
+            manager.req_to_blocks[request_id] = list(request_blocks)
+            if isinstance(manager, MambaManager):
+                manager.attach_request(request_id, state_block_idx)
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

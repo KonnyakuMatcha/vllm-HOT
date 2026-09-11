@@ -782,6 +782,7 @@ class OpenAIServingChat(GenerateBaseServing):
                         created=created_time,
                         choices=[choice_data],
                         model=model_name,
+                        continuation_handle=res.continuation_handle,
                     )
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
@@ -1174,6 +1175,7 @@ class OpenAIServingChat(GenerateBaseServing):
             prompt_text=prompt_text,
             kv_transfer_params=final_res.kv_transfer_params,
             ec_transfer_params=final_res.ec_transfer_params,
+            continuation_handle=final_res.continuation_handle,
             metrics=per_request_metrics,
         )
 

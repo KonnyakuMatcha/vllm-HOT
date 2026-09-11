@@ -576,7 +576,8 @@ class KVCacheManager:
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if not request.hot_claimed:
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -589,6 +590,30 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def detach(self, request: Request) -> tuple[KVCacheBlocks, tuple[int | None, ...]]:
+        """Detach a request's blocks for a same-device ownership transfer.
+
+        Off-table blocks only exist for KV-connector partial-tail offloads, and
+        HOT is gated on having no connector.
+        """
+        blocks, state_block_indices = self.coordinator.detach(request.request_id)
+        return self.create_kv_cache_blocks(blocks), state_block_indices
+
+    def attach(
+        self,
+        request: Request,
+        blocks: KVCacheBlocks,
+        state_block_indices: tuple[int | None, ...],
+    ) -> None:
+        """Attach blocks transferred from a HOT checkpoint."""
+        self.coordinator.attach(request.request_id, blocks.blocks, state_block_indices)
+
+    def free_blocks(self, blocks: KVCacheBlocks) -> None:
+        """Release blocks held by a detached checkpoint."""
+        self.block_pool.free_blocks(
+            reversed(list(itertools.chain.from_iterable(blocks.blocks)))
+        )
 
     def remove_skipped_blocks(
         self,
@@ -771,7 +796,7 @@ class KVCacheManager:
             num_computed_tokens: The number of computed tokens, including tokens
                 that are already cached and tokens to be cached.
         """
-        if self.enable_caching:
+        if self.enable_caching and not request.hot_claimed:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(

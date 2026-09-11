@@ -327,6 +327,7 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
     VLLM_ENABLE_HPC_OPS: bool = False
+    VLLM_ENABLE_HOT_CONTINUATION: bool = False
 
 
 def get_default_cache_root():
@@ -1176,6 +1177,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_PREFIX_CACHE_RETENTION_INTERVAL"])
         if "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in os.environ
         else None
+    ),
+    # Keep one completed hybrid-model continuation resident for an exact
+    # successor request. Disabled by default because this is single-session.
+    "VLLM_ENABLE_HOT_CONTINUATION": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_HOT_CONTINUATION", "0"))
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

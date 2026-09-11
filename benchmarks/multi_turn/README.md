@@ -176,3 +176,40 @@ The script will convert the ShareGPT dataset to a dataset with the standard user
 The flag `--max-items=128` is used to sample 128 conversations from the original dataset (change as needed).
 
 Use the output JSON file `sharegpt_conv_128.json` as the `--input-file` for `benchmark_serving_multi_turn.py`.
+
+## HOT vs. Prefix Cache for One Qwen Session
+
+`benchmark_hot_vs_prefix.py` is a small single-session benchmark for the
+Qwen3.6 NVFP4 HOT path. It sends only the new user tail with a
+`continuation_handle` in HOT mode, while prefix mode sends the complete
+conversation and relies on vLLM automatic prefix caching. Run the same command
+once per server mode:
+
+```bash
+MODEL=/ssd/nfs/models/Qwen/Qwen3.6-35B-A3B-NVFP4
+
+# HOT: VLLM_ENABLE_HOT_CONTINUATION=1, prefix caching disabled
+CUDA_VISIBLE_DEVICES=0,1 VLLM_ENABLE_HOT_CONTINUATION=1 \
+  .venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --served-model-name qwen-nvfp4 \
+  --tensor-parallel-size 2 --max-num-seqs 1 --max-model-len 96000 \
+  --port 8000
+
+.venv/bin/python benchmarks/multi_turn/benchmark_hot_vs_prefix.py \
+  --mode hot --context-chars 96000 --output /tmp/qwen-hot.json
+
+# Prefix: VLLM_ENABLE_HOT_CONTINUATION=0, prefix caching enabled
+CUDA_VISIBLE_DEVICES=0,1 VLLM_ENABLE_HOT_CONTINUATION=0 \
+  .venv/bin/python -m vllm.entrypoints.openai.api_server \
+  --model "$MODEL" --served-model-name qwen-nvfp4 \
+  --tensor-parallel-size 2 --max-num-seqs 1 --max-model-len 96000 \
+  --enable-prefix-caching --port 8000
+
+.venv/bin/python benchmarks/multi_turn/benchmark_hot_vs_prefix.py \
+  --mode prefix --context-chars 96000 --output /tmp/qwen-prefix.json
+```
+
+Use `--mode cold` with prefix caching and HOT disabled for a no-cache baseline.
+The benchmark reports per-turn TTFT and latency, plus p50/p90 summaries. Keep
+the model, GPU assignment, server flags, context size, and turn count identical
+between runs.

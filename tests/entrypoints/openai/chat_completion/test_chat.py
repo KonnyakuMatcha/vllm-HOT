@@ -993,6 +993,24 @@ def test_chat_completion_request_n_parameter_to_sampling_params():
     assert sampling_params.n == 3, f"Expected n=3, got n={sampling_params.n}"
 
 
+def test_chat_completion_request_continuation_handle_to_sampling_params():
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Continue"}],
+        continuation_handle="hot-test-handle",
+        max_tokens=10,
+    )
+
+    sampling_params = request.to_sampling_params(
+        max_tokens=10,
+        default_sampling_params={},
+    )
+
+    assert sampling_params.extra_args == {
+        "continuation_handle": "hot-test-handle",
+    }
+
+
 def test_chat_completion_request_n_parameter_default():
     """Test that n parameter defaults to 1."""
     request = ChatCompletionRequest(
