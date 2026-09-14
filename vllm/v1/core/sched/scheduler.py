@@ -2246,8 +2246,10 @@ class Scheduler(SchedulerInterface):
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
+        hot_error_req_ids: set[str] = set()
         if self.hot_error_req_ids:
-            error_req_ids.update(self.hot_error_req_ids)
+            hot_error_req_ids = set(self.hot_error_req_ids)
+            error_req_ids.update(hot_error_req_ids)
             self.hot_error_req_ids.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
@@ -2266,6 +2268,11 @@ class Scheduler(SchedulerInterface):
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
+                        stop_reason=(
+                            "invalid_continuation_handle"
+                            if request.request_id in hot_error_req_ids
+                            else None
+                        ),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
                     )

@@ -9,7 +9,7 @@ import pytest
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.envs import disable_envs_cache
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, GracefulHTTPError
 
 
 @pytest.mark.asyncio
@@ -95,3 +95,27 @@ def test_is_model_supported_skip_name_validation_env(
     disable_envs_cache()
     assert envs.VLLM_SKIP_MODEL_NAME_VALIDATION is True
     assert serving._is_model_supported("another-alias") is True
+
+
+@pytest.mark.asyncio
+async def test_raise_if_error_maps_invalid_handle_to_bad_request():
+    mock_engine = MagicMock()
+    mock_engine.model_config = MagicMock()
+    mock_engine.model_config.max_model_len = 100
+    mock_models = MagicMock()
+
+    serving = GenerateBaseServing(
+        engine_client=mock_engine,
+        models=mock_models,
+        request_logger=None,
+    )
+
+    with pytest.raises(GracefulHTTPError) as exc_info:
+        serving._raise_if_error(
+            "error",
+            "test-request-id",
+            stop_reason="invalid_continuation_handle",
+        )
+
+    assert exc_info.value.http_status == HTTPStatus.BAD_REQUEST
+    assert str(exc_info.value) == "Invalid or expired continuation handle"

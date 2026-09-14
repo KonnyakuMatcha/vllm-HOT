@@ -26,7 +26,7 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, GracefulHTTPError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
@@ -201,14 +201,28 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
         )
         return json_str
 
-    def _raise_if_error(self, finish_reason: str | None, request_id: str) -> None:
-        """Raise GenerationError if finish_reason indicates an error."""
-        if finish_reason == "error":
-            logger.error(
-                "Request %s failed with an internal error during generation",
+    def _raise_if_error(
+        self,
+        finish_reason: str | None,
+        request_id: str,
+        stop_reason: int | str | None = None,
+    ) -> None:
+        """Raise an error if finish_reason indicates an error."""
+        if finish_reason != "error":
+            return
+        if stop_reason == "invalid_continuation_handle":
+            logger.warning(
+                "Request %s failed with an invalid continuation handle",
                 request_id,
             )
-            raise GenerationError("Internal server error")
+            raise GracefulHTTPError(
+                "Invalid or expired continuation handle", HTTPStatus.BAD_REQUEST
+            )
+        logger.error(
+            "Request %s failed with an internal error during generation",
+            request_id,
+        )
+        raise GenerationError("Internal server error")
 
     def _convert_generation_error_to_streaming_response(
         self, e: GenerationError
