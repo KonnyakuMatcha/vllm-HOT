@@ -26,7 +26,7 @@ def reconstruct_continuation_tokens(
 
 @dataclass
 class HotContinuationCheckpoint:
-    """The single resident continuation state for a HOT-enabled worker."""
+    """A continuation checkpoint for one HOT-enabled session."""
 
     handle: str
     forwarded_tokens: tuple[int, ...]
@@ -36,3 +36,4 @@ class HotContinuationCheckpoint:
     tail_valid_tokens: tuple[int, ...]
     blocks: KVCacheBlocks
     mamba_state_block_indices: tuple[int | None, ...]
+    created_at: float = 0.0

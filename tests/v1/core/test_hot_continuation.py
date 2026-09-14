@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for HOT continuation ownership transfer and scheduler gates."""
 
+import time
+
 import pytest
 import torch
 
@@ -491,3 +493,34 @@ def test_evicted_checkpoint_reconstructs_full_prompt_for_tail_successor(
     # before entering the ordinary full-prefill path.
     assert successor.prompt_token_ids == first_all_tokens + tail_tokens
     assert first_handle not in scheduler.hot_token_chains
+
+
+def test_hot_checkpoint_ttl_demotes_then_expires_token_chain(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
+    monkeypatch.setattr(envs, "VLLM_HOT_CHECKPOINT_TTL", 1.0)
+    monkeypatch.setattr(envs, "VLLM_HOT_TOKEN_CHAIN_TTL", 1.0)
+    scheduler = _make_hot_scheduler()
+    handle = _save_owner_request(
+        scheduler, list(range(40)), [100, 101, 102, 103, 104]
+    )
+    assert handle is not None
+
+    checkpoint = scheduler.hot_checkpoints[handle]
+    checkpoint.created_at = time.monotonic() - 10.0
+    scheduler._prune_hot()
+
+    assert handle not in scheduler.hot_checkpoints
+    assert handle in scheduler.hot_token_chains
+
+    token_chain = scheduler.hot_token_chains[handle]
+    scheduler.hot_token_chains[handle] = (
+        token_chain[0],
+        token_chain[1],
+        token_chain[2],
+        time.monotonic() - 10.0,
+    )
+    scheduler._prune_hot()
+
+    assert handle not in scheduler.hot_token_chains

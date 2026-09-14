@@ -325,6 +325,8 @@ if TYPE_CHECKING:
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_ENABLE_HPC_OPS: bool = False
     VLLM_ENABLE_HOT_CONTINUATION: bool = False
+    VLLM_HOT_CHECKPOINT_TTL: float = 300.0
+    VLLM_HOT_TOKEN_CHAIN_TTL: float = 3600.0
 
 
 def get_default_cache_root():
@@ -1163,6 +1165,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # successor request. Disabled by default because this is single-session.
     "VLLM_ENABLE_HOT_CONTINUATION": lambda: bool(
         int(os.getenv("VLLM_ENABLE_HOT_CONTINUATION", "0"))
+    ),
+    # Seconds a block-backed HOT checkpoint may stay resident after it is
+    # saved.  Expired checkpoints are demoted to lightweight token chains so a
+    # tail-only successor can still reconstruct the full prompt and fall back
+    # to ordinary full prefill.  Set to 0 to disable expiration.
+    "VLLM_HOT_CHECKPOINT_TTL": lambda: float(
+        os.getenv("VLLM_HOT_CHECKPOINT_TTL", "300")
+    ),
+    # Seconds a lightweight HOT token chain may stay resident after the block
+    # checkpoint is evicted or expires.  Set to 0 to disable expiration.
+    "VLLM_HOT_TOKEN_CHAIN_TTL": lambda: float(
+        os.getenv("VLLM_HOT_TOKEN_CHAIN_TTL", "3600")
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and

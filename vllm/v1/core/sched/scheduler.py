@@ -103,11 +103,14 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.hot_checkpoint: HotContinuationCheckpoint | None = None
         self.hot_checkpoints: dict[str, HotContinuationCheckpoint] = {}
-        # Lightweight handle -> (forwarded_tokens, last_token, fingerprint)
-        # retained when a block-backed checkpoint is evicted.  It lets a
-        # tail-only successor reconstruct the full prompt and fall back to
-        # ordinary full prefill instead of prefilling only the tail.
-        self.hot_token_chains: dict[str, tuple[tuple[int, ...], int, str]] = {}
+        # Lightweight handle -> (forwarded_tokens, last_token, fingerprint,
+        # created_at).  Retained when a block-backed checkpoint is evicted or
+        # expires.  It lets a tail-only successor reconstruct the full prompt
+        # and fall back to ordinary full prefill instead of prefilling only
+        # the tail.
+        self.hot_token_chains: dict[
+            str, tuple[tuple[int, ...], int, str, float]
+        ] = {}
         self.hot_config_fingerprint = (
             vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
         )
@@ -577,6 +580,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        self._prune_hot()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -2428,6 +2432,7 @@ class Scheduler(SchedulerInterface):
                     checkpoint.forwarded_tokens,
                     checkpoint.last_token,
                     checkpoint.fingerprint,
+                    time.monotonic(),
                 )
             else:
                 self.hot_token_chains.pop(handle, None)
@@ -2435,6 +2440,45 @@ class Scheduler(SchedulerInterface):
             self._sync_hot_checkpoint_alias()
         elif not keep_token_chain:
             self.hot_token_chains.pop(handle, None)
+
+    def _prune_hot(self) -> None:
+        if not envs.VLLM_ENABLE_HOT_CONTINUATION:
+            return
+        now = time.monotonic()
+        checkpoint_ttl = envs.VLLM_HOT_CHECKPOINT_TTL
+        token_chain_ttl = envs.VLLM_HOT_TOKEN_CHAIN_TTL
+        if checkpoint_ttl > 0:
+            for handle, checkpoint in list(self.hot_checkpoints.items()):
+                if now - checkpoint.created_at > checkpoint_ttl:
+                    self._release_checkpoint(handle, keep_token_chain=True)
+                    logger.debug(
+                        "HOT checkpoint expired: handle=%s age=%.1fs",
+                        handle,
+                        now - checkpoint.created_at,
+                    )
+        if token_chain_ttl > 0:
+            for handle, token_chain in list(self.hot_token_chains.items()):
+                if now - token_chain[3] > token_chain_ttl:
+                    self.hot_token_chains.pop(handle, None)
+                    logger.debug(
+                        "HOT token chain expired: handle=%s age=%.1fs",
+                        handle,
+                        now - token_chain[3],
+                    )
+        if self.hot_checkpoints or self.hot_token_chains:
+            num_tokens = sum(
+                len(checkpoint.forwarded_tokens) + 1
+                for checkpoint in self.hot_checkpoints.values()
+            ) + sum(
+                len(token_chain[0]) + 1
+                for token_chain in self.hot_token_chains.values()
+            )
+            logger.debug(
+                "HOT registry: checkpoints=%d token_chains=%d pinned_tokens=%d",
+                len(self.hot_checkpoints),
+                len(self.hot_token_chains),
+                num_tokens,
+            )
 
     def _release_hot(self) -> None:
         for handle in list(self.hot_checkpoints):
@@ -2512,7 +2556,7 @@ class Scheduler(SchedulerInterface):
         if token_chain is None:
             logger.debug("HOT claim miss: no checkpoint for handle")
             return False
-        forwarded_tokens, last_token, fingerprint = token_chain
+        forwarded_tokens, last_token, fingerprint, _ = token_chain
         if self._hot_fingerprint(request) != fingerprint:
             logger.debug("HOT claim miss: token-chain fingerprint mismatch")
             self.hot_token_chains.pop(request_handle, None)
@@ -2566,6 +2610,7 @@ class Scheduler(SchedulerInterface):
             ),
             blocks=blocks,
             mamba_state_block_indices=mamba_state_block_indices,
+            created_at=time.monotonic(),
         )
         self.hot_checkpoints[checkpoint.handle] = checkpoint
         self.hot_checkpoint = checkpoint
