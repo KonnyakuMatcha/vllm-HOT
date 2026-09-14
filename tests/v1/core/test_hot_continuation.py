@@ -297,7 +297,7 @@ def test_claim_hot_full_history_rejects_token_mismatch(
     assert successor.prompt_token_ids == wrong_history
 
 
-def test_claim_hot_rejects_wrong_handle(
+def test_claim_hot_rejects_wrong_handle_without_evicting_other_session(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
@@ -308,9 +308,13 @@ def test_claim_hot_rejects_wrong_handle(
     )
 
     assert scheduler._claim_hot(successor) is False
-
-    assert scheduler.hot_checkpoint is None
     assert successor.hot_claimed is False
+    # A wrong handle must not evict another session's checkpoint.
+    assert handle in scheduler.hot_checkpoints
+
+    successor = _make_hot_request("successor", [200], continuation_handle=handle)
+    assert scheduler._claim_hot(successor) is True
+    assert scheduler.hot_checkpoint is None
 
 
 def test_claim_hot_rejects_fingerprint_mismatch(
@@ -387,15 +391,39 @@ def test_release_hot_returns_blocks_to_pool(
     )
 
 
-def test_save_hot_disabled_when_multiple_requests_can_run(
+def test_save_hot_retains_one_checkpoint_per_session(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
     scheduler = _make_hot_scheduler()
     scheduler.max_num_running_reqs = 2
-    request = _make_hot_request("owner", list(range(40)), output_token_ids=[100, 101])
 
-    assert _finish_and_save(scheduler, request) is None
+    first = _make_hot_request(
+        "owner-1", list(range(40)), output_token_ids=[100, 101]
+    )
+    second = _make_hot_request(
+        "owner-2", list(range(50, 80)), output_token_ids=[200, 201]
+    )
+    first_handle = _finish_and_save(scheduler, first)
+    second_handle = _finish_and_save(scheduler, second)
+
+    assert first_handle is not None
+    assert second_handle is not None
+    assert first_handle != second_handle
+    assert set(scheduler.hot_checkpoints) == {first_handle, second_handle}
+
+    first_successor = _make_hot_request(
+        "successor-1", [300], continuation_handle=first_handle
+    )
+    assert scheduler._claim_hot(first_successor) is True
+    assert first_handle not in scheduler.hot_checkpoints
+    assert second_handle in scheduler.hot_checkpoints
+
+    second_successor = _make_hot_request(
+        "successor-2", [400], continuation_handle=second_handle
+    )
+    assert scheduler._claim_hot(second_successor) is True
+    assert scheduler.hot_checkpoints == {}
     assert scheduler.hot_checkpoint is None
 
 

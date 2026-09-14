@@ -102,6 +102,7 @@ class Scheduler(SchedulerInterface):
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.kv_cache_config = kv_cache_config
         self.hot_checkpoint: HotContinuationCheckpoint | None = None
+        self.hot_checkpoints: dict[str, HotContinuationCheckpoint] = {}
         self.hot_config_fingerprint = (
             vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
         )
@@ -2396,22 +2397,40 @@ class Scheduler(SchedulerInterface):
         lora_id = None if lora is None else (lora.lora_int_id, lora.lora_name)
         return f"{self.hot_config_fingerprint}:{lora_id}:{request.cache_salt}"
 
+    def _max_hot_checkpoints(self) -> int:
+        # Keep at most one checkpoint per concurrently runnable session.  A
+        # successor that finds its checkpoint evicted simply falls back to the
+        # ordinary full-prefill path.
+        return max(1, self.max_num_running_reqs)
+
+    def _sync_hot_checkpoint_alias(self) -> None:
+        if (
+            self.hot_checkpoint is not None
+            and self.hot_checkpoint.handle not in self.hot_checkpoints
+        ):
+            if self.hot_checkpoints:
+                self.hot_checkpoint = list(self.hot_checkpoints.values())[-1]
+            else:
+                self.hot_checkpoint = None
+
+    def _release_checkpoint(self, handle: str) -> None:
+        checkpoint = self.hot_checkpoints.pop(handle, None)
+        if checkpoint is not None:
+            self.kv_cache_manager.free_blocks(checkpoint.blocks)
+            self._sync_hot_checkpoint_alias()
+
     def _release_hot(self) -> None:
-        if self.hot_checkpoint is not None:
-            self.kv_cache_manager.free_blocks(self.hot_checkpoint.blocks)
-            self.hot_checkpoint = None
+        for handle in list(self.hot_checkpoints):
+            self._release_checkpoint(handle)
+        self.hot_checkpoint = None
 
     def _claim_hot(self, request: Request) -> bool:
-        checkpoint = self.hot_checkpoint
-        if not envs.VLLM_ENABLE_HOT_CONTINUATION or request.continuation_handle is None:
+        request_handle = request.continuation_handle
+        if not envs.VLLM_ENABLE_HOT_CONTINUATION or request_handle is None:
             return False
 
-        if self.max_num_running_reqs != 1:
-            reason = "more than one request can run"
-        elif not self._hot_mamba_state_transfer_supported():
+        if not self._hot_mamba_state_transfer_supported():
             reason = "mamba cache mode is not 'align'"
-        elif checkpoint is None:
-            reason = "no resident checkpoint"
         elif request.prompt_token_ids is None:
             reason = "prompt token ids unavailable"
         elif request.prompt_embeds is not None:
@@ -2424,14 +2443,14 @@ class Scheduler(SchedulerInterface):
             logger.debug("HOT claim miss: %s", reason)
             return False
 
-        assert checkpoint is not None
-        if request.continuation_handle != checkpoint.handle:
-            logger.debug("HOT claim miss: handle mismatch")
-            self._release_hot()
+        checkpoint = self.hot_checkpoints.get(request_handle)
+        if checkpoint is None:
+            logger.debug("HOT claim miss: no checkpoint for handle")
             return False
+
         if self._hot_fingerprint(request) != checkpoint.fingerprint:
             logger.debug("HOT claim miss: fingerprint mismatch")
-            self._release_hot()
+            self._release_checkpoint(checkpoint.handle)
             return False
 
         tokens = tuple(request._all_token_ids)
@@ -2441,7 +2460,7 @@ class Scheduler(SchedulerInterface):
         )
         if reconstructed is None:
             logger.debug("HOT claim miss: token mismatch")
-            self._release_hot()
+            self._release_checkpoint(checkpoint.handle)
             return False
         _, tail_only = reconstructed
         if tail_only:
@@ -2452,7 +2471,8 @@ class Scheduler(SchedulerInterface):
         )
         request.num_computed_tokens = checkpoint.boundary
         request.hot_claimed = True
-        self.hot_checkpoint = None
+        self.hot_checkpoints.pop(checkpoint.handle, None)
+        self._sync_hot_checkpoint_alias()
         logger.debug(
             "HOT claim hit: boundary=%d tail_only=%s",
             checkpoint.boundary,
@@ -2463,7 +2483,6 @@ class Scheduler(SchedulerInterface):
     def _save_hot(self, request: Request) -> str | None:
         if (
             not envs.VLLM_ENABLE_HOT_CONTINUATION
-            or self.max_num_running_reqs != 1
             or not self._hot_mamba_state_transfer_supported()
             or self.num_spec_tokens > 0
             or self.connector is not None
@@ -2475,6 +2494,10 @@ class Scheduler(SchedulerInterface):
             or request.num_tokens - 1 != request.num_computed_tokens
         ):
             return None
+
+        while len(self.hot_checkpoints) >= self._max_hot_checkpoints():
+            oldest_handle = next(iter(self.hot_checkpoints))
+            self._release_checkpoint(oldest_handle)
 
         boundary = request.num_tokens - 1
         blocks, mamba_state_block_indices = self.kv_cache_manager.detach(request)
@@ -2491,7 +2514,7 @@ class Scheduler(SchedulerInterface):
             blocks=blocks,
             mamba_state_block_indices=mamba_state_block_indices,
         )
-        self._release_hot()
+        self.hot_checkpoints[checkpoint.handle] = checkpoint
         self.hot_checkpoint = checkpoint
         logger.debug("HOT checkpoint saved: boundary=%d", boundary)
         return checkpoint.handle
@@ -2700,12 +2723,11 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
-            if (
-                not request.hot_claimed
-                and self.hot_checkpoint is not None
-                and request.continuation_handle == self.hot_checkpoint.handle
-            ):
-                self._release_hot()
+            request_handle = request.continuation_handle
+            if not request.hot_claimed and request_handle is not None:
+                checkpoint = self.hot_checkpoints.get(request_handle)
+                if checkpoint is not None:
+                    self._release_checkpoint(request_handle)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
