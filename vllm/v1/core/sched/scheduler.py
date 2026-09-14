@@ -112,6 +112,7 @@ class Scheduler(SchedulerInterface):
             str, tuple[tuple[int, ...], int, str, float]
         ] = {}
         self.hot_error_req_ids: set[str] = set()
+        self.hot_handles_by_session: dict[str, str] = {}
         self.hot_config_fingerprint = (
             vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
         )
@@ -2437,6 +2438,13 @@ class Scheduler(SchedulerInterface):
             else:
                 self.hot_checkpoint = None
 
+    def _drop_session_handle(self, handle: str) -> None:
+        self.hot_handles_by_session = {
+            session_id: mapped_handle
+            for session_id, mapped_handle in self.hot_handles_by_session.items()
+            if mapped_handle != handle
+        }
+
     def _release_checkpoint(
         self, handle: str, *, keep_token_chain: bool = False
     ) -> None:
@@ -2451,10 +2459,12 @@ class Scheduler(SchedulerInterface):
                 )
             else:
                 self.hot_token_chains.pop(handle, None)
+                self._drop_session_handle(handle)
             self.kv_cache_manager.free_blocks(checkpoint.blocks)
             self._sync_hot_checkpoint_alias()
         elif not keep_token_chain:
             self.hot_token_chains.pop(handle, None)
+            self._drop_session_handle(handle)
 
     def _prune_hot(self) -> None:
         if not envs.VLLM_ENABLE_HOT_CONTINUATION:
@@ -2475,6 +2485,7 @@ class Scheduler(SchedulerInterface):
             for handle, token_chain in list(self.hot_token_chains.items()):
                 if now - token_chain[3] > token_chain_ttl:
                     self.hot_token_chains.pop(handle, None)
+                    self._drop_session_handle(handle)
                     logger.debug(
                         "HOT token chain expired: handle=%s age=%.1fs",
                         handle,
@@ -2501,11 +2512,23 @@ class Scheduler(SchedulerInterface):
         for handle in list(self.hot_token_chains):
             self.hot_token_chains.pop(handle, None)
         self.hot_error_req_ids.clear()
+        self.hot_handles_by_session.clear()
         self.hot_checkpoint = None
 
     def _claim_hot(self, request: Request) -> bool:
+        if not envs.VLLM_ENABLE_HOT_CONTINUATION:
+            return False
         request_handle = request.continuation_handle
-        if not envs.VLLM_ENABLE_HOT_CONTINUATION or request_handle is None:
+        if request_handle is None and request.session_id is not None:
+            request_handle = self.hot_handles_by_session.get(request.session_id)
+            if request_handle is not None:
+                request.continuation_handle = request_handle
+                logger.debug(
+                    "HOT auto-attach: session_id=%s handle=%s",
+                    request.session_id,
+                    request_handle,
+                )
+        if request_handle is None:
             return False
 
         if not self._hot_mamba_state_transfer_supported():
@@ -2554,6 +2577,7 @@ class Scheduler(SchedulerInterface):
         request.hot_claimed = True
         self.hot_checkpoints.pop(checkpoint.handle, None)
         self.hot_token_chains.pop(checkpoint.handle, None)
+        self._drop_session_handle(checkpoint.handle)
         self._sync_hot_checkpoint_alias()
         logger.debug(
             "HOT claim hit: boundary=%d tail_only=%s",
@@ -2596,6 +2620,7 @@ class Scheduler(SchedulerInterface):
                 list(forwarded_tokens + (last_token,))
             )
         self.hot_token_chains.pop(request_handle, None)
+        self._drop_session_handle(request_handle)
         logger.debug("HOT checkpoint evicted; using reconstructed full prefill")
         return False
 
@@ -2643,6 +2668,8 @@ class Scheduler(SchedulerInterface):
         )
         self.hot_checkpoints[checkpoint.handle] = checkpoint
         self.hot_checkpoint = checkpoint
+        if request.session_id is not None:
+            self.hot_handles_by_session[request.session_id] = checkpoint.handle
         logger.debug("HOT checkpoint saved: boundary=%d", boundary)
         return checkpoint.handle
 

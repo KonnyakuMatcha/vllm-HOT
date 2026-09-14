@@ -149,6 +149,7 @@ def _make_hot_request(
     *,
     continuation_handle: str | None = None,
     cache_salt: str | None = None,
+    session_id: str | None = None,
     output_token_ids: list[int] | None = None,
     block_size: int = 16,
 ) -> Request:
@@ -166,6 +167,7 @@ def _make_hot_request(
         sampling_params=sampling_params,
         pooling_params=None,
         cache_salt=cache_salt,
+        session_id=session_id,
         block_hasher=get_request_block_hasher(block_size, sha256),
     )
     if output_token_ids:
@@ -540,3 +542,29 @@ def test_claim_hot_missing_handle_sets_error(
     assert scheduler._claim_hot(successor) is False
     assert successor.hot_claimed is False
     assert successor.hot_claim_error is True
+
+
+def test_claim_hot_auto_attaches_from_session_id(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
+    scheduler = _make_hot_scheduler()
+
+    owner = _make_hot_request(
+        "owner",
+        list(range(40)),
+        output_token_ids=[100, 101, 102, 103, 104],
+        session_id="session-1",
+    )
+    handle = _finish_and_save(scheduler, owner)
+    assert handle is not None
+    assert scheduler.hot_handles_by_session["session-1"] == handle
+
+    # Successor does not carry continuation_handle, only the stable session_id.
+    successor = _make_hot_request("successor", [999], session_id="session-1")
+    assert successor.continuation_handle is None
+
+    assert scheduler._claim_hot(successor) is True
+    assert successor.continuation_handle == handle
+    assert successor.hot_claimed is True
+    assert "session-1" not in scheduler.hot_handles_by_session
