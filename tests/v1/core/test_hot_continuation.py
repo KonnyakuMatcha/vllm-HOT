@@ -311,6 +311,7 @@ def test_claim_hot_rejects_wrong_handle_without_evicting_other_session(
 
     assert scheduler._claim_hot(successor) is False
     assert successor.hot_claimed is False
+    assert successor.hot_claim_error is True
     # A wrong handle must not evict another session's checkpoint.
     assert handle in scheduler.hot_checkpoints
 
@@ -488,6 +489,7 @@ def test_evicted_checkpoint_reconstructs_full_prompt_for_tail_successor(
 
     assert scheduler._claim_hot(successor) is False
     assert successor.hot_claimed is False
+    assert successor.hot_claim_error is False
     assert successor.num_computed_tokens == 0
     # The tail-only request must be expanded to the full historical prompt
     # before entering the ordinary full-prefill path.
@@ -524,3 +526,17 @@ def test_hot_checkpoint_ttl_demotes_then_expires_token_chain(
     scheduler._prune_hot()
 
     assert handle not in scheduler.hot_token_chains
+
+
+def test_claim_hot_missing_handle_sets_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
+    scheduler = _make_hot_scheduler()
+    successor = _make_hot_request(
+        "successor", [200], continuation_handle="missing-handle"
+    )
+
+    assert scheduler._claim_hot(successor) is False
+    assert successor.hot_claimed is False
+    assert successor.hot_claim_error is True

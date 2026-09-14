@@ -111,6 +111,7 @@ class Scheduler(SchedulerInterface):
         self.hot_token_chains: dict[
             str, tuple[tuple[int, ...], int, str, float]
         ] = {}
+        self.hot_error_req_ids: set[str] = set()
         self.hot_config_fingerprint = (
             vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
         )
@@ -937,6 +938,10 @@ class Scheduler(SchedulerInterface):
                 hot_claimed = request.num_computed_tokens == 0 and self._claim_hot(
                     request
                 )
+                if request.hot_claim_error:
+                    request_queue.pop_request()
+                    self.hot_error_req_ids.add(request.request_id)
+                    continue
 
                 # Get already-cached tokens.
                 if hot_claimed:
@@ -2241,6 +2246,9 @@ class Scheduler(SchedulerInterface):
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
+        if self.hot_error_req_ids:
+            error_req_ids.update(self.hot_error_req_ids)
+            self.hot_error_req_ids.clear()
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
             error_req_ids.update(failed_kv_load_req_ids)
         if self.ec_connector is not None:
@@ -2485,6 +2493,7 @@ class Scheduler(SchedulerInterface):
             self._release_checkpoint(handle)
         for handle in list(self.hot_token_chains):
             self.hot_token_chains.pop(handle, None)
+        self.hot_error_req_ids.clear()
         self.hot_checkpoint = None
 
     def _claim_hot(self, request: Request) -> bool:
@@ -2504,6 +2513,7 @@ class Scheduler(SchedulerInterface):
             reason = None
         if reason is not None:
             logger.debug("HOT claim miss: %s", reason)
+            request.hot_claim_error = True
             return False
 
         checkpoint = self.hot_checkpoints.get(request_handle)
@@ -2513,6 +2523,7 @@ class Scheduler(SchedulerInterface):
         if self._hot_fingerprint(request) != checkpoint.fingerprint:
             logger.debug("HOT claim miss: fingerprint mismatch")
             self._release_checkpoint(checkpoint.handle)
+            request.hot_claim_error = True
             return False
 
         tokens = tuple(request._all_token_ids)
@@ -2523,6 +2534,7 @@ class Scheduler(SchedulerInterface):
         if reconstructed is None:
             logger.debug("HOT claim miss: token mismatch")
             self._release_checkpoint(checkpoint.handle)
+            request.hot_claim_error = True
             return False
         _, tail_only = reconstructed
         if tail_only:
@@ -2555,11 +2567,13 @@ class Scheduler(SchedulerInterface):
         token_chain = self.hot_token_chains.get(request_handle)
         if token_chain is None:
             logger.debug("HOT claim miss: no checkpoint for handle")
+            request.hot_claim_error = True
             return False
         forwarded_tokens, last_token, fingerprint, _ = token_chain
         if self._hot_fingerprint(request) != fingerprint:
             logger.debug("HOT claim miss: token-chain fingerprint mismatch")
             self.hot_token_chains.pop(request_handle, None)
+            request.hot_claim_error = True
             return False
         reconstructed = reconstruct_continuation_tokens(
             forwarded_tokens, last_token, tuple(request._all_token_ids)
@@ -2567,6 +2581,7 @@ class Scheduler(SchedulerInterface):
         if reconstructed is None:
             logger.debug("HOT claim miss: token-chain token mismatch")
             self.hot_token_chains.pop(request_handle, None)
+            request.hot_claim_error = True
             return False
         _, tail_only = reconstructed
         if tail_only:

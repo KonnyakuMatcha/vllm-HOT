@@ -199,6 +199,10 @@ class Request:
                 "continuation_handle"
             )
         self.hot_claimed = False
+        # Set when a continuation handle was supplied but cannot be resolved
+        # safely.  The scheduler converts this into a FINISHED_ERROR response
+        # instead of silently prefilling only the tail.
+        self.hot_claim_error = False
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
