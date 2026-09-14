@@ -2609,8 +2609,15 @@ class Scheduler(SchedulerInterface):
             or request.prompt_embeds is not None
             or request.mm_features
             or not request.output_token_ids
-            or request.num_in_flight_tokens
-            or request.num_tokens - 1 != request.num_computed_tokens
+            or (
+                request.num_in_flight_tokens
+                and not envs.VLLM_HOT_EXPERIMENTAL_ASYNC
+            )
+            or request.num_computed_tokens < request.num_tokens - 1
+            or (
+                not envs.VLLM_HOT_EXPERIMENTAL_ASYNC
+                and request.num_computed_tokens != request.num_tokens - 1
+            )
         ):
             return None
 

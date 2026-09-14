@@ -621,7 +621,10 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 
         from vllm import envs as vllm_envs
 
-        if vllm_envs.VLLM_ENABLE_HOT_CONTINUATION:
+        if (
+            vllm_envs.VLLM_ENABLE_HOT_CONTINUATION
+            and not vllm_envs.VLLM_HOT_EXPERIMENTAL_ASYNC
+        ):
             # HOT saves a checkpoint in the same step the request stops, so no
             # later decode step may mutate the Mamba/attention state. Async
             # scheduling deliberately pipelines such a step and is therefore

@@ -327,6 +327,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_HOT_CONTINUATION: bool = False
     VLLM_HOT_CHECKPOINT_TTL: float = 300.0
     VLLM_HOT_TOKEN_CHAIN_TTL: float = 3600.0
+    VLLM_HOT_EXPERIMENTAL_ASYNC: bool = False
 
 
 def get_default_cache_root():
@@ -1177,6 +1178,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoint is evicted or expires.  Set to 0 to disable expiration.
     "VLLM_HOT_TOKEN_CHAIN_TTL": lambda: float(
         os.getenv("VLLM_HOT_TOKEN_CHAIN_TTL", "3600")
+    ),
+    # Experimental: allow HOT with async scheduling.  This is not yet a safe
+    # default; use only for validation.
+    "VLLM_HOT_EXPERIMENTAL_ASYNC": lambda: bool(
+        int(os.getenv("VLLM_HOT_EXPERIMENTAL_ASYNC", "0"))
     ),
     # a local directory to look in for unrecognized LoRA adapters.
     # only works if plugins are enabled and
