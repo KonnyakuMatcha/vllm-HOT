@@ -103,6 +103,11 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.hot_checkpoint: HotContinuationCheckpoint | None = None
         self.hot_checkpoints: dict[str, HotContinuationCheckpoint] = {}
+        # Lightweight handle -> (forwarded_tokens, last_token, fingerprint)
+        # retained when a block-backed checkpoint is evicted.  It lets a
+        # tail-only successor reconstruct the full prompt and fall back to
+        # ordinary full prefill instead of prefilling only the tail.
+        self.hot_token_chains: dict[str, tuple[tuple[int, ...], int, str]] = {}
         self.hot_config_fingerprint = (
             vllm_config.compute_hash() if envs.VLLM_ENABLE_HOT_CONTINUATION else ""
         )
@@ -2413,15 +2418,29 @@ class Scheduler(SchedulerInterface):
             else:
                 self.hot_checkpoint = None
 
-    def _release_checkpoint(self, handle: str) -> None:
+    def _release_checkpoint(
+        self, handle: str, *, keep_token_chain: bool = False
+    ) -> None:
         checkpoint = self.hot_checkpoints.pop(handle, None)
         if checkpoint is not None:
+            if keep_token_chain:
+                self.hot_token_chains[handle] = (
+                    checkpoint.forwarded_tokens,
+                    checkpoint.last_token,
+                    checkpoint.fingerprint,
+                )
+            else:
+                self.hot_token_chains.pop(handle, None)
             self.kv_cache_manager.free_blocks(checkpoint.blocks)
             self._sync_hot_checkpoint_alias()
+        elif not keep_token_chain:
+            self.hot_token_chains.pop(handle, None)
 
     def _release_hot(self) -> None:
         for handle in list(self.hot_checkpoints):
             self._release_checkpoint(handle)
+        for handle in list(self.hot_token_chains):
+            self.hot_token_chains.pop(handle, None)
         self.hot_checkpoint = None
 
     def _claim_hot(self, request: Request) -> bool:
@@ -2445,8 +2464,7 @@ class Scheduler(SchedulerInterface):
 
         checkpoint = self.hot_checkpoints.get(request_handle)
         if checkpoint is None:
-            logger.debug("HOT claim miss: no checkpoint for handle")
-            return False
+            return self._claim_hot_from_token_chain(request, request_handle)
 
         if self._hot_fingerprint(request) != checkpoint.fingerprint:
             logger.debug("HOT claim miss: fingerprint mismatch")
@@ -2472,6 +2490,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = checkpoint.boundary
         request.hot_claimed = True
         self.hot_checkpoints.pop(checkpoint.handle, None)
+        self.hot_token_chains.pop(checkpoint.handle, None)
         self._sync_hot_checkpoint_alias()
         logger.debug(
             "HOT claim hit: boundary=%d tail_only=%s",
@@ -2479,6 +2498,40 @@ class Scheduler(SchedulerInterface):
             tail_only,
         )
         return True
+
+    def _claim_hot_from_token_chain(
+        self, request: Request, request_handle: str
+    ) -> bool:
+        """Reconstruct a full prompt for an evicted block checkpoint.
+
+        Returns False so the request goes through the ordinary prefix-cache /
+        full-prefill path.  It is intentionally not a HOT claim: the live
+        KV/Mamba state was evicted, so only the token chain is reused.
+        """
+        token_chain = self.hot_token_chains.get(request_handle)
+        if token_chain is None:
+            logger.debug("HOT claim miss: no checkpoint for handle")
+            return False
+        forwarded_tokens, last_token, fingerprint = token_chain
+        if self._hot_fingerprint(request) != fingerprint:
+            logger.debug("HOT claim miss: token-chain fingerprint mismatch")
+            self.hot_token_chains.pop(request_handle, None)
+            return False
+        reconstructed = reconstruct_continuation_tokens(
+            forwarded_tokens, last_token, tuple(request._all_token_ids)
+        )
+        if reconstructed is None:
+            logger.debug("HOT claim miss: token-chain token mismatch")
+            self.hot_token_chains.pop(request_handle, None)
+            return False
+        _, tail_only = reconstructed
+        if tail_only:
+            request.prepend_prompt_token_ids(
+                list(forwarded_tokens + (last_token,))
+            )
+        self.hot_token_chains.pop(request_handle, None)
+        logger.debug("HOT checkpoint evicted; using reconstructed full prefill")
+        return False
 
     def _save_hot(self, request: Request) -> str | None:
         if (
@@ -2497,7 +2550,7 @@ class Scheduler(SchedulerInterface):
 
         while len(self.hot_checkpoints) >= self._max_hot_checkpoints():
             oldest_handle = next(iter(self.hot_checkpoints))
-            self._release_checkpoint(oldest_handle)
+            self._release_checkpoint(oldest_handle, keep_token_chain=True)
 
         boundary = request.num_tokens - 1
         blocks, mamba_state_block_indices = self.kv_cache_manager.detach(request)

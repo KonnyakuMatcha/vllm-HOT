@@ -454,3 +454,40 @@ def test_hot_disables_async_scheduling(monkeypatch: pytest.MonkeyPatch):
     MambaModelConfig.verify_and_update_config(vllm_config)
 
     assert vllm_config.scheduler_config.async_scheduling is False
+
+
+def test_evicted_checkpoint_reconstructs_full_prompt_for_tail_successor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
+    scheduler = _make_hot_scheduler()
+
+    first = _make_hot_request(
+        "owner-1", list(range(40)), output_token_ids=[100, 101, 102, 103, 104]
+    )
+    first_handle = _finish_and_save(scheduler, first)
+    assert first_handle is not None
+    first_all_tokens = list(first._all_token_ids)
+
+    # Capacity is one, so saving a second owner evicts the block-backed
+    # checkpoint but keeps its lightweight token chain.
+    second = _make_hot_request(
+        "owner-2", list(range(50, 80)), output_token_ids=[200, 201]
+    )
+    second_handle = _finish_and_save(scheduler, second)
+    assert second_handle is not None
+    assert first_handle not in scheduler.hot_checkpoints
+    assert first_handle in scheduler.hot_token_chains
+
+    successor = _make_hot_request(
+        "successor", [999], continuation_handle=first_handle
+    )
+    tail_tokens = list(successor.prompt_token_ids)
+
+    assert scheduler._claim_hot(successor) is False
+    assert successor.hot_claimed is False
+    assert successor.num_computed_tokens == 0
+    # The tail-only request must be expanded to the full historical prompt
+    # before entering the ordinary full-prefill path.
+    assert successor.prompt_token_ids == first_all_tokens + tail_tokens
+    assert first_handle not in scheduler.hot_token_chains
