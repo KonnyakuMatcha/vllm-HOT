@@ -2403,22 +2403,34 @@ class Scheduler(SchedulerInterface):
 
     def _claim_hot(self, request: Request) -> bool:
         checkpoint = self.hot_checkpoint
-        if (
-            not envs.VLLM_ENABLE_HOT_CONTINUATION
-            or self.max_num_running_reqs != 1
-            or not self._hot_mamba_state_transfer_supported()
-            or checkpoint is None
-            or request.continuation_handle is None
-            or request.prompt_token_ids is None
-            or request.prompt_embeds is not None
-            or self.connector is not None
-        ):
+        if not envs.VLLM_ENABLE_HOT_CONTINUATION or request.continuation_handle is None:
             return False
 
-        if (
-            request.continuation_handle != checkpoint.handle
-            or self._hot_fingerprint(request) != checkpoint.fingerprint
-        ):
+        if self.max_num_running_reqs != 1:
+            reason = "more than one request can run"
+        elif not self._hot_mamba_state_transfer_supported():
+            reason = "mamba cache mode is not 'align'"
+        elif checkpoint is None:
+            reason = "no resident checkpoint"
+        elif request.prompt_token_ids is None:
+            reason = "prompt token ids unavailable"
+        elif request.prompt_embeds is not None:
+            reason = "prompt embeds"
+        elif self.connector is not None:
+            reason = "kv connector"
+        else:
+            reason = None
+        if reason is not None:
+            logger.debug("HOT claim miss: %s", reason)
+            return False
+
+        assert checkpoint is not None
+        if request.continuation_handle != checkpoint.handle:
+            logger.debug("HOT claim miss: handle mismatch")
+            self._release_hot()
+            return False
+        if self._hot_fingerprint(request) != checkpoint.fingerprint:
+            logger.debug("HOT claim miss: fingerprint mismatch")
             self._release_hot()
             return False
 
@@ -2428,6 +2440,7 @@ class Scheduler(SchedulerInterface):
             checkpoint.forwarded_tokens, checkpoint.last_token, tokens
         )
         if reconstructed is None:
+            logger.debug("HOT claim miss: token mismatch")
             self._release_hot()
             return False
         _, tail_only = reconstructed
@@ -2440,6 +2453,11 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = checkpoint.boundary
         request.hot_claimed = True
         self.hot_checkpoint = None
+        logger.debug(
+            "HOT claim hit: boundary=%d tail_only=%s",
+            checkpoint.boundary,
+            tail_only,
+        )
         return True
 
     def _save_hot(self, request: Request) -> str | None:
@@ -2475,6 +2493,7 @@ class Scheduler(SchedulerInterface):
         )
         self._release_hot()
         self.hot_checkpoint = checkpoint
+        logger.debug("HOT checkpoint saved: boundary=%d", boundary)
         return checkpoint.handle
 
     def _update_request_with_output(

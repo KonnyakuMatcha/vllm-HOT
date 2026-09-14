@@ -397,3 +397,32 @@ def test_save_hot_disabled_when_multiple_requests_can_run(
 
     assert _finish_and_save(scheduler, request) is None
     assert scheduler.hot_checkpoint is None
+
+
+def test_hot_disables_async_scheduling(monkeypatch: pytest.MonkeyPatch):
+    """HOT save must not race a pipelined decode step."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.config import MambaModelConfig
+
+    monkeypatch.setattr(envs, "VLLM_ENABLE_HOT_CONTINUATION", True)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architecture="TestMamba",
+            supports_mamba_prefix_caching=True,
+            max_model_len=1024,
+        ),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            mamba_block_size=16,
+        ),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=True,
+            enable_chunked_prefill=True,
+        ),
+    )
+
+    MambaModelConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.scheduler_config.async_scheduling is False

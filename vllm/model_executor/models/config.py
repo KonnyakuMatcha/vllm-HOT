@@ -619,6 +619,21 @@ class MambaModelConfig(VerifyAndUpdateConfig):
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
 
+        from vllm import envs as vllm_envs
+
+        if vllm_envs.VLLM_ENABLE_HOT_CONTINUATION:
+            # HOT saves a checkpoint in the same step the request stops, so no
+            # later decode step may mutate the Mamba/attention state. Async
+            # scheduling deliberately pipelines such a step and is therefore
+            # unsafe for the HOT save/release protocol.
+            if vllm_config.scheduler_config.async_scheduling:
+                logger.warning(
+                    "Disabling async scheduling because "
+                    "VLLM_ENABLE_HOT_CONTINUATION requires a synchronous "
+                    "decode boundary for checkpoint save."
+                )
+            vllm_config.scheduler_config.async_scheduling = False
+
         if cache_config.enable_prefix_caching:
             if cache_config.mamba_cache_mode == "none":
                 cache_config.mamba_cache_mode = "align"
