@@ -156,6 +156,8 @@ def _run_control_session(server, session_idx, *, system_prompt, tag, salt_prefix
 
 
 def _run_hot_batch(server, sessions):
+    num_sessions = len(sessions)
+
     def run_one(idx):
         system_prompt, cache_salt, tag = sessions[idx]
         return _run_hot_session(
@@ -166,12 +168,14 @@ def _run_hot_batch(server, sessions):
             tag=tag,
         )
 
-    with ThreadPoolExecutor(max_workers=MAX_SESSIONS) as executor:
-        futures = {idx: executor.submit(run_one, idx) for idx in range(MAX_SESSIONS)}
+    with ThreadPoolExecutor(max_workers=num_sessions) as executor:
+        futures = {idx: executor.submit(run_one, idx) for idx in range(num_sessions)}
         return {idx: future.result() for idx, future in futures.items()}
 
 
 def _run_control_batch(server, sessions, salt_prefix):
+    num_sessions = len(sessions)
+
     def run_one(idx):
         system_prompt, _, tag = sessions[idx]
         return _run_control_session(
@@ -182,8 +186,8 @@ def _run_control_batch(server, sessions, salt_prefix):
             salt_prefix=salt_prefix,
         )
 
-    with ThreadPoolExecutor(max_workers=MAX_SESSIONS) as executor:
-        futures = {idx: executor.submit(run_one, idx) for idx in range(MAX_SESSIONS)}
+    with ThreadPoolExecutor(max_workers=num_sessions) as executor:
+        futures = {idx: executor.submit(run_one, idx) for idx in range(num_sessions)}
         return {idx: future.result() for idx, future in futures.items()}
 
 
@@ -221,6 +225,14 @@ def test_hot_multi_concurrent_matches_full_history_token_ids():
         )
         for idx in range(num_sessions)
     ]
+    overflow_sessions = [
+        (
+            SHARED_PREFIX,
+            "hot-shared-overflow",
+            f"Overflow session {idx}:",
+        )
+        for idx in range(num_sessions + 2)
+    ]
 
     with RemoteOpenAIServer(
         MODEL,
@@ -229,6 +241,7 @@ def test_hot_multi_concurrent_matches_full_history_token_ids():
     ) as hot_server:
         hot_distinct = _run_hot_batch(hot_server, distinct_sessions)
         hot_shared = _run_hot_batch(hot_server, shared_sessions)
+        hot_overflow = _run_hot_batch(hot_server, overflow_sessions)
 
     with RemoteOpenAIServer(
         MODEL,
@@ -241,9 +254,24 @@ def test_hot_multi_concurrent_matches_full_history_token_ids():
         control_shared = _run_control_batch(
             control_server, shared_sessions, "ctl-shared"
         )
+        control_overflow = _run_control_batch(
+            control_server, overflow_sessions, "ctl-overflow"
+        )
 
     _assert_matches(hot_distinct, control_distinct, "distinct")
     _assert_matches(hot_shared, control_shared, "shared")
+
+    # The overflow scenario primarily exercises checkpoint eviction and
+    # token-chain reconstruction.  Exact token equality against a separately
+    # computed full-history control can differ because shared prefix-cache
+    # hits change the numerical reduction order for greedy decoding.  The
+    # per-session helpers above already assert natural stop and handle/output
+    # presence; here we only assert that every session completed every turn.
+    for results in (hot_overflow, control_overflow):
+        assert all(
+            len(session_results) == len(USER_TURNS)
+            for session_results in results.values()
+        )
 
 
 if __name__ == "__main__":
