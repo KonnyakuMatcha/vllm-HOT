@@ -57,6 +57,32 @@ HotContinuationCheckpoint
 - Invalid or expired handles return HTTP 400 instead of silently producing a
   tail-only completion.
 
+## Frontend `session_id` Adapter
+
+Most OpenAI-compatible clients are stateful at the application layer but send
+the full message history on every turn. Requiring them to remember a
+`continuation_handle` and manually strip the assistant turn is therefore a
+poor fit for the default Chat Completions API.
+
+When `VLLM_ENABLE_HOT_CONTINUATION=1`, the API server can instead maintain an
+opt-in mapping from a stable JSON `session_id` to:
+
+- the full message list that produced the previous checkpoint;
+- the server-issued `continuation_handle`; and
+- a fingerprint of the template/tools/cache salt used to produce it.
+
+On the next request the server computes the longest common prefix of the
+client's full history. If the stored history is still a prefix, it sends only
+the new suffix to the engine. A leading assistant message is dropped because
+its tokens are already owned by the checkpoint. If the history diverges, the
+session is discarded and the request falls back to a full prefill. The
+explicit `continuation_handle` API remains available for clients that want to
+implement the same optimization themselves.
+
+The adapter is intentionally an in-memory API-server cache in this draft.
+Multi-worker deployments need sticky routing or a shared session store; the
+normal stateless Chat Completions behavior is unchanged when HOT is disabled.
+
 ## Relationship to Existing Work
 
 ### #55697 / #55873 / #55875 / #55876: Application-Directed Prefix Checkpoints
@@ -150,6 +176,8 @@ sequential successor and a tiny tail.
 - Multi-session token equivalence up to 8 concurrent sessions: verified.
 - Shared-prefix + checkpoint eviction + token-chain fallback: verified.
 - Invalid/expired handle: returns HTTP 400.
+- JSON `session_id` full-history adapter: non-streaming and streaming token
+  equivalence verified against a stateless control on a 3-turn session.
 - Not yet verified: speculative decoding, KV connectors, multimodal inputs,
   PP > 1, LoRA, abort/preempt races under production load.
 
@@ -165,6 +193,10 @@ sequential successor and a tiny tail.
    to full prefill via token chains.
 4. No producer-consumer 1-to-N sharing yet.
 5. TTL and memory accounting are currently basic; no user-visible metrics.
+6. The frontend `session_id` adapter is an in-memory, per-API-worker cache;
+   multi-worker deployments need sticky routing or a shared store.
+7. Tool-call and other non-text agent suffixes are structurally supported,
+   but still need end-to-end coverage with a tool-capable model.
 
 ## Open Questions
 

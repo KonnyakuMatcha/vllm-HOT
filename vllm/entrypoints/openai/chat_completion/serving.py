@@ -10,6 +10,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 
+import vllm.envs as envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -29,6 +30,10 @@ from vllm.entrypoints.generate.base.serving import (
     build_spec_decoding_metrics,
     clamp_prompt_logprobs,
     format_token_id_placeholder,
+)
+from vllm.entrypoints.openai.chat_completion.hot_session import (
+    HotFrontendSessionManager,
+    HotSessionPlan,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
@@ -169,6 +174,11 @@ class OpenAIServingChat(GenerateBaseServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.enable_per_request_metrics = enable_per_request_metrics
+        self.hot_session_manager: HotFrontendSessionManager | None = (
+            HotFrontendSessionManager(ttl_seconds=envs.VLLM_HOT_CHECKPOINT_TTL)
+            if envs.VLLM_ENABLE_HOT_CONTINUATION
+            else None
+        )
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         mc = self.model_config
         self.override_max_tokens = (
@@ -239,6 +249,36 @@ class OpenAIServingChat(GenerateBaseServing):
 
         return await self.online_renderer.render_chat(request)
 
+    async def _tap_hot_frontend_session(
+        self,
+        session_id: str | None,
+        plan: HotSessionPlan,
+        result_generator: AsyncGenerator[RequestOutput, None],
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Record the new HOT handle after a frontend-managed request.
+
+        The engine only exposes ``continuation_handle`` on the final
+        ``RequestOutput``.  Tapping the generator here keeps both the full and
+        streaming response paths on the same bookkeeping code.
+        """
+        assert session_id is not None
+        assert self.hot_session_manager is not None
+        last_res: RequestOutput | None = None
+        try:
+            async for res in result_generator:
+                last_res = res
+                yield res
+        finally:
+            if last_res is None:
+                self.hot_session_manager.drop(session_id)
+            else:
+                self.hot_session_manager.record_response(
+                    session_id,
+                    plan.original_messages,
+                    plan.context,
+                    last_res.continuation_handle,
+                )
+
     async def create_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -272,6 +312,27 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
+        hot_session_id = self._get_session_id(request, raw_request)
+        hot_session_plan: HotSessionPlan | None = None
+        # When frontend session management is enabled it owns the HOT handle
+        # explicitly.  Disable the engine-side session auto-attach in that case
+        # so a stale mapping cannot claim a checkpoint behind our back.
+        engine_session_id = hot_session_id
+        if (
+            self.hot_session_manager is not None
+            and hot_session_id is not None
+            and request.continuation_handle is None
+        ):
+            hot_session_plan = self.hot_session_manager.prepare(hot_session_id, request)
+            engine_session_id = None
+            request.continuation_handle = (
+                hot_session_plan.continuation_handle
+                if hot_session_plan.used_handle
+                else None
+            )
+            if hot_session_plan.used_handle:
+                request.messages = hot_session_plan.messages
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -341,7 +402,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 if raw_request is None
                 else await self._get_trace_headers(raw_request.headers)
             )
-            session_id = self._get_session_id(request, raw_request)
+            session_id = engine_session_id
 
             if isinstance(sampling_params, BeamSearchParams):
                 generator = self.beam_search(
@@ -382,6 +443,11 @@ class OpenAIServingChat(GenerateBaseServing):
                     }
                     if parser is not None and parser.reasoning_parser is not None
                     else None,
+                )
+
+            if hot_session_plan is not None:
+                generator = self._tap_hot_frontend_session(
+                    hot_session_id, hot_session_plan, generator
                 )
 
             generators.append(generator)

@@ -403,7 +403,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "Stable session identity shared by related requests. Unlike "
             "request_id, this value is expected to remain stable across "
-            "multiple requests in the same conversation or agent session."
+            "multiple requests in the same conversation or agent session. "
+            "When HOT continuation is enabled, the server may use this to "
+            "remember the previous handle and send only the new message "
+            "suffix to the engine."
         ),
     )
     continuation_handle: str | None = Field(

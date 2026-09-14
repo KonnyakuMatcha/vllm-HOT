@@ -189,6 +189,15 @@ The first port should support one completion and one successor. Branching,
 parallel continuations, and multiple handles can be added only after ownership
 and output-equivalence tests are green.
 
+For OpenAI-compatible clients that always resend the full conversation
+history, the vLLM API server can provide an optional adapter on top of the same
+primitive: the client sends a stable JSON `session_id`, the server remembers
+the previous message list and `continuation_handle`, strips the already-owned
+assistant turn, and submits only the new suffix. This keeps the engine contract
+token-stable while making the common Chat Completions API ergonomic. The
+adapter is stateful, so it needs sticky routing or a shared store when the API
+tier has multiple workers.
+
 ## 5. Mapping to vLLM
 
 Use existing vLLM cache abstractions wherever possible. The relevant concepts
